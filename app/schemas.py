@@ -6,13 +6,32 @@ from enum import Enum
 
 from pydantic import BaseModel, Field, model_validator
 
-from .normalize import IssueCode, IssueSeverity
+from .normalize import IssueCode, IssueSeverity, normalize_entry
+from .selection import SelectionAction, apply_selection_rules, validate_pattern
 
 
 class EntryType(str, Enum):
     FILE = "file"
     DIRECTORY = "directory"
     SYMLINK = "symlink"
+
+
+class SelectionRuleIn(BaseModel):
+    action: SelectionAction = Field(
+        ..., description="命中后的筛选动作：include（实际解包）或 exclude（排除）"
+    )
+    pattern: str = Field(
+        ...,
+        description=(
+            "按路径段解释的 glob 模式，匹配规范化后的归档路径："
+            "* 不跨 /，? 匹配单段内一个字符，** 必须独占一段且可跨多级"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_pattern(self) -> "SelectionRuleIn":
+        validate_pattern(self.pattern)
+        return self
 
 
 class PreflightEntryIn(BaseModel):
@@ -89,6 +108,14 @@ class PreflightRequest(BaseModel):
         default=None,
         description="可选的解压资源预算校验；省略时行为与旧版完全一致",
     )
+    selection_rules: list[SelectionRuleIn] | None = Field(
+        default=None,
+        description=(
+            "可选的解包筛选规则，按规范化后的归档路径匹配；"
+            "按输入顺序依次匹配，最后一条命中规则生效，未命中默认 include；"
+            "省略时全部条目参与预检，行为与旧版完全一致"
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_required_sizes(self) -> "PreflightRequest":
@@ -100,8 +127,21 @@ class PreflightRequest(BaseModel):
             or limits.max_total_uncompressed_bytes is not None
         )
         need_ratio = limits.max_compression_ratio is not None
+        if not need_uncompressed and not need_ratio:
+            return self
+        # 被 selection_rules 排除的文件不参与资源预算，无需声明大小。
+        normalized = [
+            normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+            for i, e in enumerate(self.entries, start=1)
+        ]
+        decisions = apply_selection_rules(
+            [n.canonical_parts for n in normalized],
+            None
+            if self.selection_rules is None
+            else [(r.action.value, r.pattern) for r in self.selection_rules],
+        )
         for index, entry in enumerate(self.entries, start=1):
-            if entry.type is not EntryType.FILE:
+            if entry.type is not EntryType.FILE or not decisions[index - 1].selected:
                 continue
             if need_uncompressed and entry.uncompressed_bytes is None:
                 raise ValueError(
@@ -165,6 +205,20 @@ class PreflightEntryOut(BaseModel):
     )
     blocks_descendants: list[int] = Field(
         default_factory=list, description="被本文件条目阻挡的后代下标列表（仅文件条目）"
+    )
+    selected: bool = Field(
+        default=True,
+        description=(
+            "selection_rules 筛选结果：true 为实际解包条目；省略 "
+            "selection_rules 时恒为 true"
+        ),
+    )
+    matched_rule_index: int | None = Field(
+        default=None,
+        description=(
+            "最后一条命中的 selection_rules 下标（从 0 开始，与请求下标一致）；"
+            "未命中任何规则或省略 selection_rules 时为 null"
+        ),
     )
     issues: list[IssueOut] = Field(default_factory=list)
 
@@ -230,6 +284,17 @@ class Summary(BaseModel):
     total: int
     safe: int
     unsafe: int
+    selected: int = Field(
+        default=0,
+        description=(
+            "selection_rules 判定为实际解包（include）的条目数量；"
+            "省略 selection_rules 时等于 total"
+        ),
+    )
+    excluded: int = Field(
+        default=0,
+        description="selection_rules 判定为排除（exclude）的条目数量"
+    )
     collisions: int = Field(..., description="同名碰撞组数量")
     collision_entries: int
     hierarchy_conflicts: int

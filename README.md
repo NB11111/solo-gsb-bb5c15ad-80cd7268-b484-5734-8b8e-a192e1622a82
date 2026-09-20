@@ -6,7 +6,8 @@
 符号链接条目额外做**风险分析**：目标越界、链接链循环与祖先路径劫持；
 请求体传 `"repair": true` 还可得到确定性的改名修复计划（`repair_plan`）；
 文件条目可声明压缩/解压字节数，配合可选的 `resource_limits` 做**解压资源预算校验**
-（单文件解压大小、整批解压总量、最大压缩比）。
+（单文件解压大小、整批解压总量、最大压缩比）；可选的 `selection_rules` 可在
+预检前按规范化后的归档路径 glob **筛选实际解包条目**（include/exclude）。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -75,6 +76,8 @@ pytest -q
 确定性修复计划，见下文 [修复计划（repair=true）](#修复计划repairtrue)。
 可选的 `resource_limits` 启用解压资源预算校验，见下文
 [解压资源预算校验（resource_limits）](#解压资源预算校验resource_limits)。
+可选的 `selection_rules` 在预检前按规范化路径筛选实际解包条目，见下文
+[解包筛选规则（selection_rules）](#解包筛选规则selection_rules)。
 响应中的 `entries` **严格保持输入顺序**，`index` 从 1 开始。
 
 响应关键字段：
@@ -88,11 +91,13 @@ pytest -q
 | `entries[].collision_group` | 所属同名碰撞组编号，无碰撞为 `null` |
 | `entries[].blocked_by_file_ancestors` | 占据本条目祖先路径的文件条目下标（层级冲突） |
 | `entries[].blocks_descendants` | 本文件条目阻挡了哪些后代条目（仅文件条目） |
+| `entries[].selected` | `selection_rules` 筛选结果：`true` 为实际解包条目；省略 `selection_rules` 时恒为 `true` |
+| `entries[].matched_rule_index` | 最后一条命中的筛选规则下标（**从 0 开始**，与请求 `selection_rules` 下标一致）；未命中任何规则或省略 `selection_rules` 时为 `null` |
 | `entries[].issues` | 规范化与符号链接风险分析过程中的问题（`severity` 为 `error` 或 `info`） |
 | `collision_groups` | 碰撞组明细（含每个成员的下标与规范路径），按首次出现顺序编号 |
 | `hierarchy_conflicts` | `(file_index, descendant_index)` 层级冲突对 |
 | `symlink_analysis` | 符号链接风险分析（见下文），无链接时各列表为空 |
-| `summary` | `total / safe / unsafe / collisions / collision_entries / hierarchy_conflicts / symlinks / symlink_cycles / symlink_hijacked` 计数，以及 `declared_compressed_bytes / declared_uncompressed_bytes / resource_limits_exceeded` 资源预算摘要 |
+| `summary` | `total / safe / unsafe / selected / excluded / collisions / collision_entries / hierarchy_conflicts / symlinks / symlink_cycles / symlink_hijacked` 计数，以及 `declared_compressed_bytes / declared_uncompressed_bytes / resource_limits_exceeded` 资源预算摘要 |
 
 curl 示例：
 
@@ -255,12 +260,71 @@ curl -s http://localhost:8000/api/v1/preflight \
   -d '{"entries":[{"path":"payload.bin","type":"file","compressed_bytes":10,"uncompressed_bytes":5000}],"resource_limits":{"max_compression_ratio":100}}'
 ```
 
+## 解包筛选规则（`selection_rules`）
+
+请求体可传入可选的 `selection_rules`，在规范化完成后、碰撞/层级/符号链接/资源
+预算等一切分析**之前**，按规范化后的归档路径筛选**实际解包条目**：
+
+```json
+{
+  "entries": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "tmp/cache/a.bin", "type": "file" },
+    { "path": "tmp/keep.log", "type": "file" }
+  ],
+  "selection_rules": [
+    { "action": "exclude", "pattern": "tmp/**" },
+    { "action": "include", "pattern": "tmp/keep.log" }
+  ]
+}
+```
+
+- **匹配顺序**：规则按输入顺序依次匹配，**最后一条命中的规则生效**
+  （上例中 `tmp/keep.log` 先命中 exclude、再命中 include，最终选中）；
+  没有任何规则命中时默认 **include**。空规则列表等价于不传该字段。
+- **glob 语义（按路径段解释）**：匹配目标为条目规范化后的归档路径
+  （正斜杠分隔、NFC、段尾点/空格已裁剪，保留原始大小写）：
+  - `*` 匹配单个路径段内任意数量（含 0）的非 `/` 字符，**不得跨 `/`**；
+  - `?` 匹配单个路径段内恰好一个非 `/` 字符；
+  - `**` 必须**独占一个路径段**，匹配零或任意多个完整路径段
+    （如 `a/**/b` 可匹配 `a/b` 与 `a/x/y/b`；`tmp/**` 匹配 `tmp` 下至少一层
+    的内容，但不匹配 `tmp` 自身；单独的 `**` 匹配任意深度的全部路径）。
+- **大小写**：匹配**区分大小写**，模式本身不做 NFC 规范化或大小写折叠
+  （需要同时覆盖大小写变体时请显式列出多条规则）。模式中的 `\` 按字面字符
+  处理，不视为分隔符（条目路径中的 `\` 已在规范化阶段统一为 `/`）。
+- **响应**：每个条目（含被排除条目）都返回 `selected` 与 `matched_rule_index`
+  （下标**从 0 开始**，与请求中的规则下标一致；未命中为 `null`）；
+  `summary.selected` / `summary.excluded` 给出计数。
+- **被排除条目的行为**：仍返回完整的规范化信息（`canonical_path`、
+  `comparison_key`、规范化阶段的 issues、`safe` 等），但**不参与**同名碰撞、
+  层级冲突、符号链接劫持/循环分析、资源预算统计与 `repair_plan`；
+  `entries` 仍按输入顺序返回全部条目，**所有关联下标（碰撞组、层级冲突、
+  链接链、repair 计划等）保持原请求下标不变**。被排除的符号链接不出现在
+  `symlink_analysis.links` 中，也不会劫持选中条目的祖先路径；被排除文件
+  不要求声明 `compressed_bytes` / `uncompressed_bytes`（即使启用了资源限制）。
+- **非法规则返回 422**：`action` 非 `include`/`exclude`、`pattern` 缺失或为空、
+  模式以 `/` 开头或结尾、含空段（`//`）、或 `**` 未独占一个路径段
+  （如 `a/**b`、`**x/y`）均返回 422。
+- **兼容性**：省略 `selection_rules` 时每个条目 `"selected": true`、
+  `"matched_rule_index": null`，`summary.selected` 等于 `total`、
+  `summary.excluded` 为 0，其余行为与旧版完全一致。
+
+curl 示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/preflight \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[{"path":"tmp/a.log","type":"file"},{"path":"keep.txt","type":"file"}],"selection_rules":[{"action":"exclude","pattern":"tmp/**"}]}'
+```
+
 ## 修复计划（`repair=true`）
 
 请求体加 `"repair": true` 后，响应在原有字段之外**额外**包含 `repair_plan`
 （`repair` 省略或为 `false` 时该字段不出现，响应保持兼容）。原有诊断结果
 （`collision_groups`、`hierarchy_conflicts`、`entries[].issues` 等）保持不变，
-修复计划只是附加建议。
+修复计划只是附加建议。存在 `selection_rules` 时，`repair_plan.entries`
+**只包含选中（include）条目**，下标沿用原请求下标；被排除条目既不改名也不
+计入 `skipped_count`，但其规范化信息仍在响应的 `entries` 中给出。
 
 修复规则：
 
@@ -339,6 +403,7 @@ curl -s http://localhost:8000/api/v1/preflight \
 │   ├── service.py       # 碰撞分组、层级冲突、资源预算与符号链接分析编排
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
+│   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务
