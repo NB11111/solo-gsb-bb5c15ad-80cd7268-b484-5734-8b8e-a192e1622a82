@@ -7,12 +7,41 @@ from enum import Enum
 from pydantic import BaseModel, Field, model_validator
 
 from .normalize import IssueCode, IssueSeverity
+from .selection import compile_selection_pattern
 
 
 class EntryType(str, Enum):
     FILE = "file"
     DIRECTORY = "directory"
     SYMLINK = "symlink"
+
+
+class SelectionAction(str, Enum):
+    INCLUDE = "include"
+    EXCLUDE = "exclude"
+
+
+class SelectionRule(BaseModel):
+    """预检前按规范化归档路径筛选实际解包条目的单条规则。"""
+
+    action: SelectionAction = Field(
+        ..., description="命中时的动作：include（纳入）或 exclude（排除）"
+    )
+    pattern: str = Field(
+        ...,
+        description=(
+            "glob 路径模式，匹配规范化后的归档路径（按路径段解释，"
+            "大小写不敏感）：* 匹配单段内任意字符但不跨 /；"
+            "? 匹配单段内恰好一个字符；** 仅可作为完整段，匹配 0 个或多个段。"
+            "规则按输入顺序匹配，最后一条命中的规则生效，未命中默认 include"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_pattern(self) -> "SelectionRule":
+        # 复用 service 层的编译逻辑做唯一权威校验；非法模式在此抛错 → 422。
+        compile_selection_pattern(self.pattern)
+        return self
 
 
 class PreflightEntryIn(BaseModel):
@@ -89,6 +118,15 @@ class PreflightRequest(BaseModel):
         default=None,
         description="可选的解压资源预算校验；省略时行为与旧版完全一致",
     )
+    selection_rules: list[SelectionRule] | None = Field(
+        default=None,
+        description=(
+            "可选的解包条目筛选规则，按规范化后的归档路径匹配；规则按输入"
+            "顺序匹配、最后一条命中规则生效、未命中默认 include。被排除条目"
+            "仍返回规范化信息，但不参与碰撞、层级冲突、符号链接风险、资源"
+            "预算与 repair 计划。省略时行为与旧版完全一致"
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_required_sizes(self) -> "PreflightRequest":
@@ -155,6 +193,20 @@ class PreflightEntryOut(BaseModel):
     canonical_path: str = Field(..., description="规范化路径（NFC、段尾已裁剪，正斜杠分隔）")
     comparison_key: str | None = Field(
         ..., description="Windows 等价比较键（小写折叠，仅安全条目可用）"
+    )
+    selected: bool = Field(
+        default=True,
+        description=(
+            "是否通过 selection_rules 被选中参与实际解包分析；未提供 "
+            "selection_rules 时恒为 true。被排除条目仍返回规范化信息"
+        ),
+    )
+    matched_rule_index: int | None = Field(
+        default=None,
+        description=(
+            "决定取舍的最后一条命中 selection_rules 规则下标（从 1 开始，"
+            "与规则输入顺序一致）；未命中任何规则或未提供规则时为 null"
+        ),
     )
     safe: bool
     collision_group: int | None = Field(
@@ -230,6 +282,17 @@ class Summary(BaseModel):
     total: int
     safe: int
     unsafe: int
+    selected: int = Field(
+        default=0,
+        description=(
+            "被 selection_rules 选中（参与碰撞/层级/符号链接/资源预算/repair）"
+            "的条目数；未提供规则时等于 total"
+        ),
+    )
+    excluded: int = Field(
+        default=0,
+        description="被 selection_rules 排除的条目数；未提供规则时为 0",
+    )
     collisions: int = Field(..., description="同名碰撞组数量")
     collision_entries: int
     hierarchy_conflicts: int

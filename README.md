@@ -6,7 +6,8 @@
 符号链接条目额外做**风险分析**：目标越界、链接链循环与祖先路径劫持；
 请求体传 `"repair": true` 还可得到确定性的改名修复计划（`repair_plan`）；
 文件条目可声明压缩/解压字节数，配合可选的 `resource_limits` 做**解压资源预算校验**
-（单文件解压大小、整批解压总量、最大压缩比）。
+（单文件解压大小、整批解压总量、最大压缩比）；可选的 `selection_rules` 可在预检前
+按**规范化后的归档路径** include/exclude 实际解包条目（按路径段解释的 `*`、`?`、`**` glob）。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -75,6 +76,8 @@ pytest -q
 确定性修复计划，见下文 [修复计划（repair=true）](#修复计划repairtrue)。
 可选的 `resource_limits` 启用解压资源预算校验，见下文
 [解压资源预算校验（resource_limits）](#解压资源预算校验resource_limits)。
+可选的 `selection_rules` 在预检前筛选实际解包条目，见下文
+[条目筛选（selection_rules）](#条目筛选selection_rules)。
 响应中的 `entries` **严格保持输入顺序**，`index` 从 1 开始。
 
 响应关键字段：
@@ -84,15 +87,17 @@ pytest -q
 | `entries[].canonical_path` | 规范路径：正斜杠 `/` 分隔、每段 Unicode NFC、段尾空格与句点已裁剪，保留原始大小写用于展示 |
 | `entries[].link_target` | 符号链接目标（仅 `symlink` 条目有值，其余为 `null`） |
 | `entries[].comparison_key` | Windows 等价比较键（在规范路径上做大小写折叠 `casefold`）；不安全条目为 `null` |
+| `entries[].selected` | 是否通过 `selection_rules` 被选中参与实际解包分析；未提供规则时恒为 `true`。被排除条目仍返回规范化信息 |
+| `entries[].matched_rule_index` | 决定取舍的最后一条命中规则下标（从 1 开始，与规则输入顺序一致）；未命中任何规则或未提供规则时为 `null` |
 | `entries[].safe` | 是否可安全解包 |
-| `entries[].collision_group` | 所属同名碰撞组编号，无碰撞为 `null` |
-| `entries[].blocked_by_file_ancestors` | 占据本条目祖先路径的文件条目下标（层级冲突） |
-| `entries[].blocks_descendants` | 本文件条目阻挡了哪些后代条目（仅文件条目） |
+| `entries[].collision_group` | 所属同名碰撞组编号，无碰撞为 `null`（被 `selection_rules` 排除的条目恒为 `null`） |
+| `entries[].blocked_by_file_ancestors` | 占据本条目祖先路径的文件条目下标（层级冲突；被排除条目恒为空列表） |
+| `entries[].blocks_descendants` | 本文件条目阻挡了哪些后代条目（仅文件条目；被排除条目恒为空列表） |
 | `entries[].issues` | 规范化与符号链接风险分析过程中的问题（`severity` 为 `error` 或 `info`） |
 | `collision_groups` | 碰撞组明细（含每个成员的下标与规范路径），按首次出现顺序编号 |
 | `hierarchy_conflicts` | `(file_index, descendant_index)` 层级冲突对 |
 | `symlink_analysis` | 符号链接风险分析（见下文），无链接时各列表为空 |
-| `summary` | `total / safe / unsafe / collisions / collision_entries / hierarchy_conflicts / symlinks / symlink_cycles / symlink_hijacked` 计数，以及 `declared_compressed_bytes / declared_uncompressed_bytes / resource_limits_exceeded` 资源预算摘要 |
+| `summary` | `total / safe / unsafe / selected / excluded / collisions / collision_entries / hierarchy_conflicts / symlinks / symlink_cycles / symlink_hijacked` 计数，以及 `declared_compressed_bytes / declared_uncompressed_bytes / resource_limits_exceeded` 资源预算摘要。`selected / excluded` 为 `selection_rules` 的筛选统计（无规则时 `selected == total`、`excluded == 0`）；其余冲突/链接/预算统计只计选中条目 |
 
 curl 示例：
 
@@ -255,6 +260,79 @@ curl -s http://localhost:8000/api/v1/preflight \
   -d '{"entries":[{"path":"payload.bin","type":"file","compressed_bytes":10,"uncompressed_bytes":5000}],"resource_limits":{"max_compression_ratio":100}}'
 ```
 
+## 条目筛选（`selection_rules`）
+
+请求体可传入可选的 `selection_rules`，在所有深度分析**之前**按**规范化后的归档路径**
+（NFC、段尾空格/句点裁剪、正斜杠分隔，并在 `casefold` 比较键上匹配，与碰撞/层级判定
+一样**大小写不敏感**）筛选实际参与解包分析的条目：
+
+```json
+{
+  "entries": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "docs/secret.key", "type": "file" },
+    { "path": "docs/tmp/cache.tmp", "type": "file" },
+    { "path": "bin/tool.exe", "type": "file" }
+  ],
+  "selection_rules": [
+    { "action": "exclude", "pattern": "docs/tmp/**" },
+    { "action": "exclude", "pattern": "**/*.key" },
+    { "action": "include", "pattern": "docs/**" }
+  ]
+}
+```
+
+每条规则为 `{"action": "include" | "exclude", "pattern": "<glob>"}`：
+
+- **匹配顺序**：规则严格按输入顺序逐条匹配，**最后一条命中的规则生效**；
+  没有任何规则命中时默认 **include**。上例中 `docs/readme.txt` 先未命中前两条
+  exclude、最后命中 `docs/**`（include），最终纳入；`docs/secret.key` 命中
+  `**/*.key`（exclude）后不再命中 `docs/**` 之外的规则，最终排除；
+  `bin/tool.exe` 未命中任何规则，按默认 include 纳入。
+- **glob 语义（按路径段解释，段分隔符恒为 `/`）**：
+
+  | 通配符 | 含义 |
+  | --- | --- |
+  | `*` | 匹配**单个路径段内**任意数量字符（含 0 个），**不跨越 `/`**，如 `*.txt` 匹配 `a.txt` 但不匹配 `dir/a.txt` |
+  | `?` | 匹配单个路径段内**恰好 1 个**字符，不跨越 `/`，如 `a?.txt` 匹配 `a1.txt` 但不匹配 `a12.txt` |
+  | `**` | 只能作为**完整路径段**出现（`**`、`a/**`、`**/b`、`a/**/b`），匹配 **0 个或多个路径段**，可跨多级目录；如 `**/x.txt` 匹配 `x.txt`、`a/x.txt`、`a/b/x.txt` |
+
+  其他字符（含 `[`、`]` 等）均按**字面量**匹配。
+- **匹配基准**：针对规范化结果匹配，因此反斜杠分隔、段尾点/空格裁剪、Unicode NFC
+  与大小写差异都会先被抹平；例如模式 `docs/*.txt` 可以命中原始路径
+  `Docs\ReadMe.TXT`。规范化后无有效段的路径（如 `.`）只能被 `**` 命中。
+- **非法规则（422）**：`pattern` 为空/纯空白、含反斜杠、以 `/` 开头或结尾、
+  含空段（`a//b`）、或整段 `**` 与其他字符混用（`a**/b`、`**x`），以及
+  `action` 不是 `include`/`exclude`，均返回 422。`selection_rules` 传空列表
+  `[]` 合法，等价于不筛选。
+
+**被排除（exclude）条目**：
+
+- 仍在 `entries` 中原样返回，带完整的**规范化信息**（`canonical_path`、
+  `comparison_key`、规范化问题等），但 `selected` 为 `false`，并给出最终命中的
+  `matched_rule_index`；
+- **不参与**同名碰撞、文件-目录层级冲突、符号链接风险分析（目标越界/链接链循环/
+  祖先路径劫持）、资源预算校验以及 `repair_plan`；其 `collision_group` 为 `null`、
+  层级冲突下标列表为空，被排除的符号链接不会出现在 `symlink_analysis` 中，
+  也不会计入声明字节与整批总量；
+- **所有下标保持原请求下标**：`entries[].index`、碰撞/层级/链接结果与
+  `repair_plan.entries[].index` 中的下标均指向原始请求位置，不会因排除而重排；
+  `repair_plan.entries` 只包含选中条目。
+- `safe`/`unsafe` 仍按该条目自身的规范化结果给出（排除只影响深度分析）；
+  `summary.total/safe/unsafe` 统计全部条目，冲突/链接/预算类统计只计选中条目，
+  另以 `summary.selected` / `summary.excluded` 给出筛选计数。
+
+省略 `selection_rules` 时所有条目 `selected` 为 `true`、`matched_rule_index`
+为 `null`，新增字段仅以兼容默认值出现，响应与旧版完全一致。
+
+curl 示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/preflight \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[{"path":"docs/readme.txt","type":"file"},{"path":"docs/tmp/x.tmp","type":"file"}],"selection_rules":[{"action":"exclude","pattern":"docs/tmp/**"}]}'
+```
+
 ## 修复计划（`repair=true`）
 
 请求体加 `"repair": true` 后，响应在原有字段之外**额外**包含 `repair_plan`
@@ -264,6 +342,8 @@ curl -s http://localhost:8000/api/v1/preflight \
 
 修复规则：
 
+- **只包含 `selection_rules` 选中的条目**。被排除的条目不出现在
+  `repair_plan.entries` 中（其下标也不参与重排），选中条目之间才执行下列规则。
 1. **只处理安全的 file/directory 条目**。不安全条目标记 `"skipped": true`、
    `repaired_path` 为 `null`、`reasons` 为 `["UNSAFE"]`，绝不改名，也不参与
    碰撞/层级复检。**所有符号链接一律 skipped**（`reasons` 为 `["SYMLINK"]`），
@@ -335,8 +415,9 @@ curl -s http://localhost:8000/api/v1/preflight \
 ├── app/
 │   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算与符号链接分析编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 selection_rules、repair_plan、symlink_analysis、resource_limits）
+│   ├── service.py       # 条目筛选、碰撞分组、层级冲突、资源预算与符号链接分析编排
+│   ├── selection.py     # selection_rules：include/exclude 与按路径段解释的 *、?、** glob 匹配（纯函数）
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）

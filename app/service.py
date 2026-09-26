@@ -1,4 +1,4 @@
-"""预检编排：规范化 → 符号链接风险分析 → 资源预算校验 → 同名碰撞分组 → 层级冲突检测（纯内存）。"""
+"""预检编排：规范化 → 条目筛选 → 符号链接风险分析 → 资源预算校验 → 同名碰撞分组 → 层级冲突检测（纯内存）。"""
 
 from __future__ import annotations
 
@@ -15,6 +15,12 @@ from .schemas import (
     PreflightRequest,
     PreflightResponse,
     Summary,
+)
+from .selection import (
+    CompiledRule,
+    SelectionResult,
+    apply_selection_rules,
+    compile_selection_pattern,
 )
 from .symlink import analyze_symlinks
 
@@ -97,14 +103,28 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         for i, e in enumerate(request.entries, start=1)
     ]
 
+    # 条目筛选在所有深度分析之前：selection_rules 按规范化后的归档路径匹配，
+    # 被排除的条目不参与后续符号链接风险、资源预算、碰撞、层级冲突与 repair
+    # 计划，但其规范化信息仍原样返回（下标保持原请求下标）。
+    rules: list[CompiledRule] = [
+        CompiledRule(
+            index=i,
+            action=rule.action.value,
+            tokens=compile_selection_pattern(rule.pattern),
+        )
+        for i, rule in enumerate(request.selection_rules or (), start=1)
+    ]
+    selection = apply_selection_rules(normalized, rules)
+    active = [e for e in normalized if selection[e.index].selected]
+
     # 符号链接风险分析先于碰撞/层级检测：被劫持条目会被标记为不安全，
     # 从而退出后续碰撞分组、层级冲突与 repair 复检。
     link_targets = {
         i: e.link_target
         for i, e in enumerate(request.entries, start=1)
-        if e.link_target is not None
+        if e.link_target is not None and selection[i].selected
     }
-    symlink_analysis = analyze_symlinks(normalized, link_targets)
+    symlink_analysis = analyze_symlinks(active, link_targets)
 
     # 资源预算校验紧随符号链接分析：超限文件被标记为不安全，
     # 从而退出后续碰撞分组、层级冲突与 repair 复检。
@@ -114,10 +134,13 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
             compressed=e.compressed_bytes, uncompressed=e.uncompressed_bytes
         )
         for i, e in enumerate(request.entries, start=1)
-        if e.compressed_bytes is not None or e.uncompressed_bytes is not None
+        if (
+            selection[i].selected
+            and (e.compressed_bytes is not None or e.uncompressed_bytes is not None)
+        )
     }
     resource_outcome = check_resource_budgets(
-        normalized,
+        active,
         declared_sizes,
         max_file_uncompressed_bytes=(
             limits.max_file_uncompressed_bytes if limits else None
@@ -128,9 +151,9 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         max_compression_ratio=limits.max_compression_ratio if limits else None,
     )
 
-    index_to_group = _collision_groups(normalized)
+    index_to_group = _collision_groups(active)
 
-    conflicts = _hierarchy_conflicts(normalized)
+    conflicts = _hierarchy_conflicts(active)
     blocked_by: dict[int, list[int]] = {}
     blocks: dict[int, list[int]] = {}
     hierarchy_out: list[HierarchyConflict] = []
@@ -166,7 +189,7 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
 
     # 碰撞组明细（仅包含真实发生碰撞的组）。
     groups_detail: dict[int, dict] = {}
-    for entry in normalized:
+    for entry in active:
         group_no = index_to_group.get(entry.index)
         if group_no is None:
             continue
@@ -192,7 +215,7 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
     }
 
     # 碰撞提示问题。
-    for entry in normalized:
+    for entry in active:
         group_no = index_to_group.get(entry.index)
         if group_no is not None:
             _add_issue(
@@ -204,14 +227,22 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
                 ),
             )
 
+    all_link_targets = {
+        i: e.link_target
+        for i, e in enumerate(request.entries, start=1)
+        if e.link_target is not None
+    }
+
     entry_out = [
         PreflightEntryOut(
             index=e.index,
             type=EntryType(e.entry_type),
             original_path=e.original_path,
-            link_target=link_targets.get(e.index),
+            link_target=all_link_targets.get(e.index),
             canonical_path=e.canonical_path,
             comparison_key=e.comparison_key,
+            selected=selection[e.index].selected,
+            matched_rule_index=selection[e.index].matched_rule_index,
             safe=not e.unsafe,
             collision_group=index_to_group.get(e.index),
             blocked_by_file_ancestors=blocked_by.get(e.index, []),
@@ -231,10 +262,13 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
     ]
 
     unsafe_count = sum(1 for e in normalized if e.unsafe)
+    selected_count = sum(1 for r in selection.values() if r.selected)
     summary = Summary(
         total=len(normalized),
         safe=len(normalized) - unsafe_count,
         unsafe=unsafe_count,
+        selected=selected_count,
+        excluded=len(normalized) - selected_count,
         collisions=len(collision_groups),
         collision_entries=len(index_to_group),
         hierarchy_conflicts=len(hierarchy_out),
@@ -248,7 +282,7 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
 
     if request.repair:
         repair_plan = build_repair_plan(
-            entries=normalized,
+            entries=active,
             collision_groups=group_members,
             blocks=blocks,
             collisions_total=len(collision_groups),
